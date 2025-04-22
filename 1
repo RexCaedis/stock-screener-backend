@@ -1,0 +1,17 @@
+mkdir stock-screener-backend
+cd stock-screener-backend
+
+# Add your main.py (copy from canvas)
+# Create requirements.txt
+echo "fastapi\nuvicorn[standard]" > requirements.txt
+
+# Optional: add README and .gitignore
+echo "# Stock Screener Backend" > README.md
+echo "__pycache__/\n*.pyc" > .gitignore
+
+# Init Git
+git init
+git remote add origin https://github.com/RexCaedis/stock-screener-backend.git
+git add .
+git commit -m "Initial commit"
+git push -u origin master
