@@ -1,12 +1,13 @@
 import os
+import time
 from typing import Dict, List
 
 import requests
 
-API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+API_KEY = os.getenv("FINNHUB_API_KEY", "")
 DEFAULT_STOCKS = [
     "AAPL", "AMD", "NVDA", "TSLA", "PLTR", "RIOT", "MARA", "FCEL", "CLSK", "SOFI",
-    "HOOD", "RIVN", "LCID", "OPEN", "F", "NIO", "BBAI", "SOUN", "IONQ", "MARA"
+    "HOOD", "RIVN", "LCID", "OPEN", "F", "NIO", "BBAI", "SOUN", "IONQ"
 ]
 
 
@@ -18,50 +19,76 @@ def get_watchlist() -> List[str]:
     return [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
 
 
-def get_stock_data(symbol: str, interval: str = "1min") -> Dict:
+def _resolution(interval: str) -> str:
+    mapping = {
+        "1min": "1",
+        "5min": "5",
+        "15min": "15",
+        "30min": "30",
+        "60min": "60",
+        "1h": "60",
+        "1d": "D",
+    }
+    return mapping.get(interval, "1")
+
+
+def get_stock_quote(symbol: str) -> Dict:
     if not API_KEY:
-        return {"error": "Missing ALPHA_VANTAGE_API_KEY environment variable."}
+        return {"error": "Missing FINNHUB_API_KEY environment variable."}
 
     response = requests.get(
-        "https://www.alphavantage.co/query",
-        params={
-            "function": "TIME_SERIES_INTRADAY",
-            "symbol": symbol,
-            "interval": interval,
-            "apikey": API_KEY,
-            "outputsize": "compact",
-        },
+        "https://finnhub.io/api/v1/quote",
+        params={"symbol": symbol.upper(), "token": API_KEY},
         timeout=20,
     )
     return response.json()
 
 
-def _series_key(interval: str) -> str:
-    return f"Time Series ({interval})"
+def get_stock_data(symbol: str, interval: str = "1min") -> Dict:
+    """Compatibility helper used by /debug. Returns Finnhub quote data."""
+    return get_stock_quote(symbol)
 
 
 def get_candles(symbol: str, interval: str = "1min") -> List[Dict]:
-    data = get_stock_data(symbol.upper(), interval)
-    key = _series_key(interval)
-    series = data.get(key, {})
+    if not API_KEY:
+        return []
+
+    now = int(time.time())
+    start = now - 60 * 60 * 24 * 5
+
+    response = requests.get(
+        "https://finnhub.io/api/v1/stock/candle",
+        params={
+            "symbol": symbol.upper(),
+            "resolution": _resolution(interval),
+            "from": start,
+            "to": now,
+            "token": API_KEY,
+        },
+        timeout=20,
+    )
+    data = response.json()
+
+    if data.get("s") != "ok":
+        return []
 
     candles = []
-    for timestamp, row in sorted(series.items()):
+    for index, timestamp in enumerate(data.get("t", [])):
         candles.append({
             "time": timestamp,
-            "open": float(row["1. open"]),
-            "high": float(row["2. high"]),
-            "low": float(row["3. low"]),
-            "close": float(row["4. close"]),
-            "volume": int(float(row["5. volume"])),
+            "open": float(data["o"][index]),
+            "high": float(data["h"][index]),
+            "low": float(data["l"][index]),
+            "close": float(data["c"][index]),
+            "volume": int(float(data["v"][index])),
         })
     return candles
 
 
-def _safe_percent_change(open_price: float, close_price: float) -> float:
-    if open_price == 0:
+def _safe_percent_change(previous_close: float, current_price: float) -> float:
+    if previous_close == 0:
         return 0
-    return ((close_price - open_price) / open_price) * 100
+    return ((current_price - previous_close) / previous_close) * 100
 
 
 def get_filtered_stocks(
@@ -69,29 +96,30 @@ def get_filtered_stocks(
     max_price: float = 20,
     min_volume: int = 500000,
     min_change: float = 5,
-    min_relative_volume: float = 1,
+    min_relative_volume: float = 0,
     interval: str = "1min",
 ) -> List[Dict]:
     filtered = []
 
     for symbol in get_watchlist():
-        candles = get_candles(symbol, interval)
-        if not candles:
+        quote = get_stock_quote(symbol)
+        if quote.get("error"):
             continue
 
-        latest = candles[-1]
-        close_price = latest["close"]
-        open_price = latest["open"]
-        percent_change = _safe_percent_change(open_price, close_price)
-        volume = latest["volume"]
+        current_price = float(quote.get("c") or 0)
+        previous_close = float(quote.get("pc") or 0)
+        percent_change = _safe_percent_change(previous_close, current_price)
 
+        candles = get_candles(symbol, interval)
+        latest_volume = candles[-1]["volume"] if candles else 0
         previous_candles = candles[-21:-1]
-        average_volume = sum(candle["volume"] for candle in previous_candles) / len(previous_candles) if previous_candles else volume
-        relative_volume = volume / average_volume if average_volume else 0
+        average_volume = sum(candle["volume"] for candle in previous_candles) / len(previous_candles) if previous_candles else latest_volume
+        relative_volume = latest_volume / average_volume if average_volume else 0
+        last_matched = candles[-1]["time"] if candles else None
 
         matches = (
-            min_price <= close_price <= max_price
-            and volume >= min_volume
+            min_price <= current_price <= max_price
+            and latest_volume >= min_volume
             and percent_change >= min_change
             and relative_volume >= min_relative_volume
         )
@@ -99,9 +127,9 @@ def get_filtered_stocks(
         if matches:
             filtered.append({
                 "symbol": symbol,
-                "price": round(close_price, 2),
+                "price": round(current_price, 2),
                 "change": round(percent_change, 2),
-                "volume": volume,
+                "volume": latest_volume,
                 "relativeVolume": round(relative_volume, 2),
                 "matchedCriteria": [
                     f"Price ${min_price:g}-${max_price:g}",
@@ -109,7 +137,7 @@ def get_filtered_stocks(
                     f"Change ≥ {min_change:g}%",
                     f"RelVol ≥ {min_relative_volume:g}x",
                 ],
-                "lastMatched": latest["time"],
+                "lastMatched": last_matched,
             })
 
     return filtered
